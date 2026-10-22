@@ -1,0 +1,24 @@
+{
+  "appId": "local.notes.desktop",
+  "productName": "Local Notes",
+  "asar": true,
+  "directories": {
+    "output": "release"
+  },
+  "files": [
+    "dist/**/*",
+    "electron/**/*",
+    "api.mjs",
+    "package.json"
+  ],
+  "extraMetadata": {
+    "main": "electron/main.cjs"
+  },
+  "mac": {
+    "category": "public.app-category.productivity",
+    "identity": null,
+    "target": [
+      "dmg"
+    ]
+  }
+}

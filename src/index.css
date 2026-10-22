@@ -1,0 +1,10 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+html, body, #root { height: 100%; }
+body { @apply bg-zinc-50 text-zinc-900 antialiased; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+
+/* task lists from remark-gfm */
+.prose .contains-task-list { list-style: none; padding-left: 0.25rem; }
+.prose .task-list-item input { margin: 0 0.5rem 0 0; vertical-align: middle; accent-color: #18181b; }
+.prose .contains-task-list .contains-task-list { padding-left: 1.5rem; }

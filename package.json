@@ -1,0 +1,37 @@
+{
+  "name": "local-notes",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "start": "node server.mjs",
+    "typecheck": "tsc --noEmit",
+    "desktop": "npm run build && electron .",
+    "desktop:pack": "npm run build && electron-builder --config electron-builder.json --mac --dir",
+    "desktop:dmg": "npm run build && electron-builder --config electron-builder.json --mac dmg"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "zustand": "^5.0.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/typography": "^0.5.16",
+    "@tailwindcss/vite": "^4.1.8",
+    "@types/react": "^19.1.6",
+    "@types/react-dom": "^19.1.5",
+    "@vitejs/plugin-react": "^4.5.1",
+    "electron": "^45.0.0",
+    "electron-builder": "^26.15.3",
+    "tailwindcss": "^4.1.8",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5"
+  },
+  "main": "electron/main.cjs",
+  "productName": "Local Notes"
+}
