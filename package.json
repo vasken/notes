@@ -13,7 +13,9 @@
     "typecheck": "tsc --noEmit",
     "desktop": "npm run build && electron .",
     "desktop:pack": "npm run build && electron-builder --config electron-builder.json --mac --dir",
-    "desktop:dmg": "npm run build && electron-builder --config electron-builder.json --mac dmg"
+    "desktop:dmg": "npm run build && electron-builder --config electron-builder.json --mac dmg",
+    "desktop:build": "sh scripts/build-app.sh",
+    "desktop:install": "sh scripts/install-app.sh"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

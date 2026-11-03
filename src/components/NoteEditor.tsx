@@ -1,6 +1,7 @@
 import {
   useRef,
   useState,
+  type DragEvent,
   type KeyboardEvent,
 } from 'react';
 
@@ -16,6 +17,7 @@ import {
   ListChecks,
   Pencil,
   Trash2,
+  Upload,
   X,
 } from 'lucide-react';
 
@@ -24,7 +26,12 @@ import { relTime } from '../lib/util';
 
 import { Button, Separator } from './ui';
 import { Markdown } from './Markdown';
-import { NoteSnippetCards, SnippetTools } from './Snippets';
+import {
+  NoteSnippetCards,
+  SketchButtons,
+  SnippetTools,
+  useSketchActions,
+} from './Snippets';
 
 type Mode = 'edit' | 'split' | 'preview';
 
@@ -54,6 +61,13 @@ export function NoteEditor({
 
   const [mode, setModeState] = useState<Mode>(initialMode);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [dropping, setDropping] = useState(false);
+
+  const sketchActions = useSketchActions({
+    noteId: id,
+    textareaRef,
+    useSelection: mode !== 'preview',
+  });
 
   if (!note) return null;
 
@@ -155,6 +169,39 @@ export function NoteEditor({
       element.focus();
       element.setSelectionRange(caret, caret);
     });
+  };
+
+  // Only JSON files take over the drop; others keep default behavior.
+  // An empty type covers platforms that hide it until drop.
+  const draggingJson = (event: DragEvent) =>
+    [...event.dataTransfer.items].some(
+      item =>
+        item.kind === 'file' &&
+        (item.type === 'application/json' || item.type === ''),
+    );
+
+  const onDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!draggingJson(event)) return;
+
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+    setDropping(true);
+  };
+
+  const onDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      setDropping(false);
+    }
+  };
+
+  const onDrop = (event: DragEvent<HTMLDivElement>) => {
+    setDropping(false);
+
+    const file = event.dataTransfer.files[0];
+    if (!file) return;
+
+    event.preventDefault();
+    void sketchActions.importFile(file);
   };
 
   const onKeyDown = (
@@ -341,6 +388,8 @@ export function NoteEditor({
 
         <Separator vertical />
 
+        <SketchButtons actions={sketchActions} />
+
         <SnippetTools
           noteId={id}
           textareaRef={textareaRef}
@@ -370,13 +419,31 @@ export function NoteEditor({
         </div>
       </div>
 
-      <div className="flex min-h-0 flex-1">
+      <div
+        className="relative flex min-h-0 flex-1"
+        onDragOver={onDragOver}
+        onDragLeave={onDragLeave}
+        onDrop={onDrop}
+      >
+        {dropping && (
+          <div className="pointer-events-none absolute inset-2 z-10 flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-zinc-400 bg-white/90 text-sm text-zinc-600">
+            <Upload className="h-5 w-5" />
+            {showEdit
+              ? 'Drop to add the sketch at the cursor'
+              : 'Drop to add the sketch to the end of this note'}
+          </div>
+        )}
+
         {showEdit && (
           <textarea
             ref={textareaRef}
             value={body}
             onChange={event => setBody(event.target.value)}
             onKeyDown={onKeyDown}
+            onPaste={event => {
+              const text = event.clipboardData.getData('text/plain');
+              if (sketchActions.importPasted(text)) event.preventDefault();
+            }}
             placeholder="Start writing…"
             spellCheck
             className={
@@ -401,8 +468,24 @@ export function NoteEditor({
 
       {showEdit && <NoteSnippetCards noteId={id} />}
 
-      <footer className="border-t border-zinc-100 px-4 py-1.5 text-xs text-zinc-400">
-        Edited {relTime(note.updatedAt)}
+      <footer className="flex items-center gap-3 border-t border-zinc-100 px-4 py-1.5 text-xs text-zinc-400">
+        <span className="shrink-0">Edited {relTime(note.updatedAt)}</span>
+
+        {sketchActions.error && (
+          <span role="alert" className="ml-auto flex min-w-0 items-center gap-1 text-red-600">
+            <span className="truncate" title={sketchActions.error}>
+              Sketch not imported: {sketchActions.error}
+            </span>
+            <button
+              type="button"
+              aria-label="Dismiss"
+              onClick={sketchActions.clearError}
+              className="shrink-0 rounded p-0.5 hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-300"
+            >
+              <X className="h-3 w-3" />
+            </button>
+          </span>
+        )}
       </footer>
     </div>
   );

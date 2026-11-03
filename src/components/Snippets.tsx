@@ -1,4 +1,5 @@
 import {
+  useEffect,
   useRef,
   useState,
   type RefObject,
@@ -6,7 +7,15 @@ import {
 
 import { useStore } from '../store';
 import type { Snippet, SnippetKind } from '../types';
-import { ImportSketchButton } from './ImportSketchButton';
+import {
+  ImportSketchButton,
+  importSketch,
+  isJsonFile,
+  readSketchFile,
+  sketchJsonIn,
+  spliceSnippet,
+  type Insertion,
+} from './ImportSketchButton';
 
 import {
   removeSnippetReference,
@@ -14,7 +23,7 @@ import {
 } from '../lib/util';
 
 import { SketchView } from './SketchView';
-import { Pencil } from 'lucide-react';
+import { Pencil, Shapes, Upload } from 'lucide-react';
 import { Button } from './ui';
 
 type Draft = {
@@ -617,6 +626,200 @@ function SnippetDialog({
   );
 }
 
+function captureInsertion(
+  noteId: string,
+  textarea: HTMLTextAreaElement | null,
+): Insertion | null {
+  const note = useStore.getState().notes.find(
+    item => item.id === noteId,
+  );
+  if (!note) return null;
+
+  return {
+    body: note.body,
+    start: textarea?.selectionStart ?? note.body.length,
+    end: textarea?.selectionEnd ?? note.body.length,
+  };
+}
+
+export type SketchActions = ReturnType<typeof useSketchActions>;
+
+/**
+ * New, imported (file, drop) and pasted sketches all land at the
+ * cursor and open straight in the sketch editor.
+ */
+export function useSketchActions({
+  noteId,
+  textareaRef,
+  useSelection,
+}: {
+  noteId: string;
+  textareaRef: RefObject<HTMLTextAreaElement | null>;
+  useSelection: boolean;
+}) {
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const capture = () =>
+    captureInsertion(
+      noteId,
+      useSelection ? textareaRef.current : null,
+    );
+
+  const fail = (cause: unknown, fallback: string) => {
+    setError(cause instanceof Error ? cause.message : fallback);
+  };
+
+  const create = () => {
+    const insertion = capture();
+    if (!insertion) return;
+
+    setError(null);
+
+    const state = useStore.getState();
+    const sketchId = state.createSketch();
+
+    const id = state.createSnippet({
+      title: 'Untitled sketch',
+      summary: '',
+      kind: 'sketch',
+      content: sketchId,
+    });
+
+    const note = state.notes.find(item => item.id === noteId);
+    if (!note) return;
+
+    state.updateNote(noteId, {
+      body: spliceSnippet(note.body, id, insertion).body,
+    });
+
+    // The sketch editor ignores keys aimed at text fields.
+    (document.activeElement as HTMLElement | null)?.blur();
+    state.openSketch(sketchId);
+  };
+
+  const importFile = async (file: File) => {
+    const insertion = capture();
+    setBusy(true);
+    setError(null);
+
+    try {
+      if (!isJsonFile(file)) {
+        throw new Error(
+          `${file.name} is not a sketch. Sketches import from .json files.`,
+        );
+      }
+
+      importSketch(
+        noteId,
+        await readSketchFile(file),
+        file.name,
+        insertion,
+      );
+    } catch (cause) {
+      fail(cause, 'Could not import the sketch.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** True when the pasted text was taken as a sketch. */
+  const importPasted = (text: string): boolean => {
+    const value = sketchJsonIn(text);
+    if (!value) return false;
+
+    try {
+      importSketch(noteId, value, 'Pasted sketch', capture());
+      setError(null);
+      return true;
+    } catch (cause) {
+      // Keep the paste as text, and say why it was not a sketch.
+      fail(cause, 'Could not import the sketch.');
+      return false;
+    }
+  };
+
+  const createRef = useRef(create);
+  createRef.current = create;
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const mod = event.metaKey || event.ctrlKey;
+      if (!mod || !event.shiftKey || event.key.toLowerCase() !== 'k') return;
+
+      if (useStore.getState().editingSketchId) return;
+
+      // Other fields (titles, dialogs) keep their own keys.
+      const target = event.target as HTMLElement;
+      const typing =
+        target.tagName === 'INPUT' ||
+        target.tagName === 'SELECT' ||
+        (target.tagName === 'TEXTAREA' && target !== textareaRef.current) ||
+        target.isContentEditable;
+      if (typing || document.querySelector('[role="dialog"]')) return;
+
+      event.preventDefault();
+      createRef.current();
+    };
+
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [textareaRef]);
+
+  return {
+    create,
+    importFile,
+    importPasted,
+    busy,
+    error,
+    clearError: () => setError(null),
+  };
+}
+
+/** "Sketch" and its import option, joined as one control. */
+export function SketchButtons({ actions }: { actions: SketchActions }) {
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  return (
+    <div className="flex">
+      <Button
+        variant="outline"
+        title="New sketch (Ctrl/Cmd+Shift+K)"
+        onClick={actions.create}
+        className="rounded-r-none"
+      >
+        <Shapes className="h-4 w-4" />
+        Sketch
+      </Button>
+
+      <Button
+        variant="outline"
+        size="icon"
+        disabled={actions.busy}
+        title="Import sketch JSON. You can also drop a .json file on the note, or paste sketch JSON."
+        aria-label="Import sketch JSON"
+        onClick={() => fileRef.current?.click()}
+        className="-ml-px rounded-l-none"
+      >
+        <Upload className="h-4 w-4" />
+      </Button>
+
+      <input
+        ref={fileRef}
+        type="file"
+        accept=".json,application/json"
+        aria-label="Choose sketch JSON"
+        hidden
+        onChange={event => {
+          const file = event.currentTarget.files?.[0];
+          event.currentTarget.value = '';
+          if (file) void actions.importFile(file);
+        }}
+      />
+    </div>
+  );
+}
+
 export function SnippetTools({
   noteId,
   textareaRef,
@@ -627,27 +830,16 @@ export function SnippetTools({
   useSelection: boolean;
 }) {
   const [adding, setAdding] = useState(false);
-
-  const insertionRef = useRef<{
-    body: string;
-    start: number;
-    end: number;
-  } | null>(null);
+  const insertionRef = useRef<Insertion | null>(null);
 
   const begin = () => {
-    const note = useStore.getState().notes.find(
-      item => item.id === noteId,
+    const insertion = captureInsertion(
+      noteId,
+      useSelection ? textareaRef.current : null,
     );
-    if (!note) return;
+    if (!insertion) return;
 
-    const textarea = useSelection ? textareaRef.current : null;
-
-    insertionRef.current = {
-      body: note.body,
-      start: textarea?.selectionStart ?? note.body.length,
-      end: textarea?.selectionEnd ?? note.body.length,
-    };
-
+    insertionRef.current = insertion;
     setAdding(true);
   };
 
@@ -656,23 +848,11 @@ export function SnippetTools({
     const note = state.notes.find(item => item.id === noteId);
     if (!note) return;
 
-    const insertion = insertionRef.current;
-    const unchanged = insertion?.body === note.body;
-
-    const start = unchanged
-      ? insertion.start
-      : note.body.length;
-
-    const end = unchanged
-      ? insertion.end
-      : note.body.length;
-
-    const reference = `\n\nsnippet:${id}\n\n`;
-
-    const body =
-      note.body.slice(0, start) +
-      reference +
-      note.body.slice(end);
+    const { body, caret } = spliceSnippet(
+      note.body,
+      id,
+      insertionRef.current,
+    );
 
     state.updateNote(noteId, { body });
 
@@ -682,12 +862,12 @@ export function SnippetTools({
       if (
         !useSelection ||
         !textarea ||
-        textarea.value !== body
+        textarea.value !== body ||
+        useStore.getState().editingSketchId
       ) {
         return;
       }
 
-      const caret = start + reference.length;
       textarea.focus();
       textarea.setSelectionRange(caret, caret);
     });

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Rebuild the desktop app in the background after every commit.
+# Skip once with: SKIP_APP_BUILD=1 git commit ...
+[ -n "${SKIP_APP_BUILD:-}" ] && exit 0
+root=$(git rev-parse --show-toplevel)
+nohup "$root/scripts/build-app.sh" >/dev/null 2>&1 &
+exit 0

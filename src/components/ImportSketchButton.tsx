@@ -340,6 +340,144 @@ export function parseSketch(
   };
 }
 
+export type Insertion = {
+  body: string;
+  start: number;
+  end: number;
+};
+
+/**
+ * Put a snippet reference on its own lines at the captured selection.
+ * If the note changed since the capture, append instead.
+ */
+export function spliceSnippet(
+  body: string,
+  id: string,
+  insertion?: Insertion | null,
+): { body: string; caret: number } {
+  const unchanged = insertion?.body === body;
+  const start = unchanged ? insertion.start : body.length;
+  const end = unchanged ? insertion.end : body.length;
+  const reference = `\n\nsnippet:${id}\n\n`;
+
+  return {
+    body: body.slice(0, start) + reference + body.slice(end),
+    caret: start + reference.length,
+  };
+}
+
+/** Parsed JSON when the text has the shape of a sketch file, else null. */
+export function sketchJsonIn(text: string): unknown | null {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith('{') || !trimmed.includes('"shapes"')) {
+    return null;
+  }
+
+  try {
+    const value = JSON.parse(trimmed) as unknown;
+    return value &&
+      typeof value === 'object' &&
+      Array.isArray((value as { shapes?: unknown }).shapes)
+      ? value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export const isJsonFile = (file: File) =>
+  file.type === 'application/json' || /\.json$/i.test(file.name);
+
+export async function readSketchFile(file: File): Promise<unknown> {
+  if (file.size > MAX_FILE_BYTES) {
+    throw new Error('Choose a sketch JSON file smaller than 5 MB.');
+  }
+
+  try {
+    return JSON.parse(await file.text()) as unknown;
+  } catch {
+    throw new Error(`${file.name} is not valid JSON.`);
+  }
+}
+
+/**
+ * Atomic import: sketch, snippet and note reference land together,
+ * then the editor opens on the new sketch.
+ */
+export function importSketch(
+  noteId: string,
+  value: unknown,
+  filename: string,
+  insertion?: Insertion | null,
+) {
+  const imported = parseSketch(value, filename);
+
+  // Read the latest state; the file read may have been asynchronous.
+  const state = useStore.getState();
+  const note = state.notes.find(item => item.id === noteId);
+
+  if (!note) {
+    throw new Error('The destination note no longer exists.');
+  }
+
+  const sketchId = uid();
+  const snippetId = uid();
+  const now = Date.now();
+
+  const sketch: Sketch = {
+    id: sketchId,
+    w: imported.w,
+    h: imported.h,
+    shapes: imported.shapes,
+    updatedAt: now,
+  };
+
+  const snippet: Snippet = {
+    id: snippetId,
+    title: imported.title,
+    summary: imported.summary,
+    kind: 'sketch',
+    content: sketchId,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const sketches = { ...state.sketches, [sketchId]: sketch };
+  const snippets = { ...state.snippets, [snippetId]: snippet };
+  const { body } = spliceSnippet(note.body, snippetId, insertion);
+
+  const notes = state.notes.map(item =>
+    item.id === noteId ? { ...item, body, updatedAt: now } : item,
+  );
+
+  const bytes = new Blob([
+    JSON.stringify({
+      version: 1,
+      notes,
+      groups: state.groups,
+      sketches,
+      snippets,
+    }),
+  ]).size;
+
+  if (bytes > MAX_STATE_BYTES) {
+    throw new Error(
+      'Importing this sketch would make the notes data exceed 40 MB.',
+    );
+  }
+
+  // The sketch editor ignores keys aimed at text fields.
+  (document.activeElement as HTMLElement | null)?.blur();
+
+  // The existing store subscription handles autosave.
+  useStore.setState({
+    notes,
+    sketches,
+    snippets,
+    editingSketchId: sketchId,
+  });
+}
+
 export function ImportSketchButton({
   noteId,
   onImported,
@@ -356,89 +494,7 @@ export function ImportSketchButton({
     setError(null);
 
     try {
-      if (file.size > MAX_FILE_BYTES) {
-        throw new Error('Choose a sketch JSON file smaller than 5 MB.');
-      }
-
-      const imported = parseSketch(
-        JSON.parse(await file.text()) as unknown,
-        file.name,
-      );
-
-      // Read the latest state after the asynchronous file read.
-      const state = useStore.getState();
-      const note = state.notes.find(item => item.id === noteId);
-
-      if (!note) {
-        throw new Error('The destination note no longer exists.');
-      }
-
-      const sketchId = uid();
-      const snippetId = uid();
-      const now = Date.now();
-
-      const sketch: Sketch = {
-        id: sketchId,
-        w: imported.w,
-        h: imported.h,
-        shapes: imported.shapes,
-        updatedAt: now,
-      };
-
-      const snippet: Snippet = {
-        id: snippetId,
-        title: imported.title,
-        summary: imported.summary,
-        kind: 'sketch',
-        content: sketchId,
-        createdAt: now,
-        updatedAt: now,
-      };
-
-      const sketches = { ...state.sketches };
-      sketches[sketchId] = sketch;
-
-      const snippets = { ...state.snippets };
-      snippets[snippetId] = snippet;
-
-      const notes = state.notes.map(item =>
-        item.id === noteId
-          ? {
-              ...item,
-              body:
-                item.body +
-                `\n\nsnippet:${snippetId}\n\n`,
-              updatedAt: now,
-            }
-          : item,
-      );
-
-      const candidate = {
-        version: 1,
-        notes,
-        groups: state.groups,
-        sketches,
-        snippets,
-      };
-
-      const bytes = new Blob([
-        JSON.stringify(candidate),
-      ]).size;
-
-      if (bytes > MAX_STATE_BYTES) {
-        throw new Error(
-          'Importing this sketch would make the notes data exceed 40 MB.',
-        );
-      }
-
-      // Atomic import: no partially created sketch or snippet.
-      // The existing store subscription handles autosave.
-      useStore.setState({
-        notes,
-        sketches,
-        snippets,
-        editingSketchId: sketchId,
-      });
+      importSketch(noteId, await readSketchFile(file), file.name);
       onImported?.();
     } catch (cause) {
       setError(

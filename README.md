@@ -17,6 +17,23 @@ npm start              # http://127.0.0.1:5180
 Options (env vars): `PORT`, `HOST` (defaults to `127.0.0.1` — local only), `NOTES_DATA_DIR` (defaults to `./data`).
 Requires Node 18+.
 
+## Desktop app
+
+```bash
+npm run desktop:dmg      # build release/mac-arm64/Local Notes.app + release/Local Notes-*.dmg
+npm run desktop:build    # same, with a log (release/build.log) and a macOS notification when done
+npm run desktop:install  # quit the running app, replace /Applications/Local Notes.app with the build, relaunch
+```
+
+`desktop:install` asks before quitting a running app (check it shows "Saved" first; edits that haven't been saved
+yet may be lost on quit). `-- -y` skips the prompt, `-- --no-open` skips the relaunch. Your notes live in
+`~/Library/Application Support/Local Notes/`, outside the app, so replacing the app doesn't touch them.
+
+**Auto-build on commit** (one-time setup per clone): `git config core.hooksPath .githooks`.
+After that, every commit rebuilds the app in the background (`git commit` returns immediately). Commits made during a
+build are coalesced into one follow-up build. Skip it for one commit with `SKIP_APP_BUILD=1 git commit ...`.
+The build uses the working tree, so any uncommitted changes are included (the log warns when that happens).
+
 ## Features
 
 **Notes** — markdown with GFM (tables, task lists, strikethrough). Edit / Split / Preview modes, formatting toolbar,
@@ -30,8 +47,9 @@ infinite canvas:
 - **Tidy** re-flows each group into a grid; **Fit** zooms to show everything
 - scroll to pan, Ctrl/⌘ + scroll (or pinch) to zoom; the search box highlights matches
 
-**Sketches**: use **Add snippet → Sketch** in a note to create a drawing (stored as vector shapes), or import an
-editable sketch JSON file. Click any sketch in preview to edit it.
+**Sketches**: click **Sketch** in a note's toolbar (or press `Ctrl/⌘+Shift+K`) to start a drawing at the cursor
+(stored as vector shapes). To import an editable sketch JSON file, use the upload button next to **Sketch**, drop the
+`.json` file onto the note, or paste the JSON into the note. Click any sketch in preview to edit it.
 
 | Assist feature | What it does |
 | --- | --- |
