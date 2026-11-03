@@ -202,8 +202,13 @@ export function arrowHead(a: Pt, b: Pt, width: number): string {
 export const compactStroke = (pts: Pt[]) => rdp(pts, 0.6).map((p) => ({ x: r1(p.x), y: r1(p.y) }));
 
 // ---------- shape utilities ----------
+export function textWidth(text: string, size: number) {
+  return Math.max(8, text.length * size * 0.56);
+}
+
 export function textBox(s: Extract<Shape, { kind: 'text' }>) {
-  return { x: s.x, y: s.y, w: Math.max(8, s.text.length * s.size * 0.56), h: s.size * 1.1 };
+  const w = textWidth(s.text, s.size);
+  return { x: s.align === 'center' ? s.x - w / 2 : s.x, y: s.y, w, h: s.size * 1.1 };
 }
 
 export function outline(s: Shape): Pt[] {

@@ -2,7 +2,8 @@ import { useRef, useState } from 'react';
 import { Upload } from 'lucide-react';
 
 import { useStore } from '../store';
-import type { Pt, Shape, Sketch, Snippet } from '../types';
+import type { Binding, Pt, Shape, Sketch, Snippet } from '../types';
+import { cloneShapes, resolveLayout } from '../lib/sketch-layout';
 import { uid } from '../lib/util';
 import { Button } from './ui';
 
@@ -116,7 +117,34 @@ function point(value: unknown, label: string): Pt {
   };
 }
 
-function parseSketch(
+function reference(value: unknown, label: string): string | undefined {
+  if (value === undefined) return undefined;
+
+  if (typeof value !== 'string' || !value || value.length > 200) {
+    throw new Error(`${label} must be a shape id.`);
+  }
+
+  return value;
+}
+
+/** "boxId" floats to the shape's edge; { id, fx, fy } pins a point on it. */
+function binding(value: unknown, label: string): Binding | undefined {
+  if (value === undefined) return undefined;
+
+  if (typeof value === 'string') {
+    return { id: reference(value, label)!, fx: 0.5, fy: 0.5 };
+  }
+
+  const item = record(value, label);
+
+  return {
+    id: reference(item.id, `${label}.id`) ?? '',
+    fx: number(item.fx ?? 0.5, `${label}.fx`, 0, 1),
+    fy: number(item.fy ?? 0.5, `${label}.fy`, 0, 1),
+  };
+}
+
+export function parseSketch(
   value: unknown,
   filename: string,
 ): ImportedSketch {
@@ -136,17 +164,48 @@ function parseSketch(
   }
 
   let totalPoints = 0;
+  const seen = new Set<string>();
+  const labels: Shape[] = [];
 
   const shapes: Shape[] = data.shapes.map((value, index) => {
     const label = `Shape ${index + 1}`;
     const item = record(value, label);
 
-    // Imported IDs are regenerated to avoid collisions.
+    // Optional ids let shapes refer to each other (labels, connectors).
+    // They are regenerated after parsing to avoid collisions.
+    const sourceId = reference(item.id, `${label}.id`);
+
+    if (sourceId && seen.has(sourceId)) {
+      throw new Error(`${label} repeats the id "${sourceId}".`);
+    }
+
+    if (sourceId) seen.add(sourceId);
+
     const base = {
-      id: uid(),
+      id: sourceId ?? uid(),
       color: color(item.color, '#18181b', false),
       width: number(item.width ?? 2, `${label}.width`, 0.1, 100),
     };
+
+    // Shorthand: "label": "Text" on a shape or connector adds an attached label.
+    if (item.label !== undefined) {
+      if (item.kind === 'text' || item.kind === 'path') {
+        throw new Error(`${label}: only shapes and connectors can have a label.`);
+      }
+
+      labels.push({
+        id: uid(),
+        kind: 'text',
+        x: 0,
+        y: 0,
+        text: text(item.label, '', 10000, `${label}.label`),
+        size: number(item.labelSize ?? 16, `${label}.labelSize`, 1, 1000),
+        color: color(item.labelColor, '#18181b', false),
+        width: 1,
+        labelFor: base.id,
+        align: 'center',
+      });
+    }
 
     switch (item.kind) {
       case 'rect':
@@ -178,6 +237,12 @@ function parseSketch(
           kind: item.kind,
           a: point(item.a, `${label}.a`),
           b: point(item.b, `${label}.b`),
+          ...(item.from !== undefined
+            ? { from: binding(item.from, `${label}.from`) }
+            : {}),
+          ...(item.to !== undefined
+            ? { to: binding(item.to, `${label}.to`) }
+            : {}),
         };
 
       case 'path':
@@ -239,6 +304,12 @@ function parseSketch(
           ),
           text: text(item.text, '', 100000, `${label}.text`),
           size: number(item.size ?? 20, `${label}.size`, 1, 1000),
+          ...(item.labelFor !== undefined
+            ? { labelFor: reference(item.labelFor, `${label}.labelFor`) }
+            : {}),
+          ...(item.align === 'center' || item.labelFor !== undefined
+            ? { align: 'center' as const }
+            : {}),
         };
 
       default:
@@ -263,7 +334,9 @@ function parseSketch(
     ),
     w: number(data.w ?? 960, 'Canvas width', 1, MAX_CANVAS_SIZE),
     h: number(data.h ?? 600, 'Canvas height', 1, MAX_CANVAS_SIZE),
-    shapes,
+    // Fresh ids with references remapped (unknown ones dropped), then
+    // labels and connector ends placed on their shapes.
+    shapes: resolveLayout(cloneShapes([...shapes, ...labels])),
   };
 }
 

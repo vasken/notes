@@ -7,34 +7,65 @@ import {
 
 import {
   ArrowUpRight,
+  BringToFront,
   Circle,
+  CopyPlus,
   Eraser,
   Grid3x3,
+  Link2,
   MousePointer2,
   Pencil,
   Redo2,
+  SendToBack,
   Slash,
   Square,
   Trash2,
   Type,
   Undo2,
+  Unlink2,
   Wand2,
 } from 'lucide-react';
 
 import { SKETCH_H, SKETCH_W, useStore } from '../store';
-import type { Pt, Shape } from '../types';
+import type { Binding, Pt, Shape } from '../types';
 
 import {
   anchorsOf,
   compactStroke,
   dist,
   hitTest,
+  outline,
   recognize,
   shapeBounds,
   snapAngle,
   softSnap,
   translate,
 } from '../lib/shapes';
+
+import {
+  attachTexts,
+  bindingFor,
+  canHaveLabel,
+  cloneShapes,
+  detachFrom,
+  detachLabels,
+  hostAt,
+  isConnector,
+  isHost,
+  isLabel,
+  removeShapes,
+  resolveLayout,
+  withLabels,
+  type Connector,
+  type TextShape,
+} from '../lib/sketch-layout';
+
+import {
+  snapMove,
+  snapPoint,
+  snapResize,
+  type Guide,
+} from '../lib/sketch-guides';
 
 import {
   boxBetween,
@@ -102,8 +133,14 @@ const GRID = 20;
 const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 200;
 
-type TextShape = Extract<Shape, { kind: 'text' }>;
-type Connector = Extract<Shape, { kind: 'line' | 'arrow' }>;
+type Mods = { shiftKey: boolean; altKey: boolean };
+const NO_MODS: Mods = { shiftKey: false, altKey: false };
+
+type End = { point: Pt; binding?: Binding };
+
+// Shared across sketches for the session, so shapes can be pasted into another sketch.
+let clipboard: Shape[] = [];
+let pasteCount = 0;
 
 type Transaction = {
   before: Shape[];
@@ -119,6 +156,7 @@ type Gesture =
   | (Transaction & {
       kind: 'move';
       ids: Set<string>;
+      box: Box | null;
     })
   | (Transaction & {
       kind: 'resize';
@@ -142,8 +180,6 @@ type Gesture =
 type TextDraft = {
   shape: TextShape;
   existing: boolean;
-  labelFor?: string;
-  center?: Pt;
 };
 
 function isFillable(shape: Shape) {
@@ -167,7 +203,7 @@ export function SketchEditor({ id }: { id: string }) {
   const openSketch = useStore(s => s.openSketch);
 
   const [shapes, setShapes] = useState<Shape[]>(
-    () => initial?.shapes ?? [],
+    () => resolveLayout(initial?.shapes ?? []),
   );
   const shapesRef = useRef(shapes);
 
@@ -208,6 +244,8 @@ export function SketchEditor({ id }: { id: string }) {
   const [draft, setDraft] = useState<Shape | null>(null);
   const [marquee, setMarquee] = useState<Box | null>(null);
   const [snapHint, setSnapHint] = useState<Pt | null>(null);
+  const [bindHint, setBindHint] = useState<string | null>(null);
+  const [guides, setGuides] = useState<Guide[]>([]);
 
   const [textDraft, setTextDraft] = useState<TextDraft | null>(null);
   const textRef = useRef<TextDraft | null>(null);
@@ -240,9 +278,12 @@ export function SketchEditor({ id }: { id: string }) {
     }
   }, [textDraft?.shape.id]);
 
+  // Every change goes through resolveLayout so labels and bound
+  // connector ends follow their host shapes, live during drags too.
   const preview = (next: Shape[]) => {
-    shapesRef.current = next;
-    setShapes(next);
+    const resolved = resolveLayout(next);
+    shapesRef.current = resolved;
+    setShapes(resolved);
   };
 
   const select = (next: Set<string>) => {
@@ -263,14 +304,15 @@ export function SketchEditor({ id }: { id: string }) {
   ) => {
     preview(next);
 
-    if (JSON.stringify(next) === JSON.stringify(before)) return;
+    const resolved = shapesRef.current;
+    if (JSON.stringify(resolved) === JSON.stringify(before)) return;
 
     undoRef.current = [...undoRef.current.slice(-99), before];
     redoRef.current = [];
     syncHistory();
 
     // Save completed operations, not intermediate drag positions.
-    saveSketch(id, next);
+    saveSketch(id, resolved);
   };
 
   const undo = () => {
@@ -298,10 +340,90 @@ export function SketchEditor({ id }: { id: string }) {
   const deleteSelected = () => {
     if (!selectedRef.current.size) return;
 
-    commit(
-      shapesRef.current.filter(s => !selectedRef.current.has(s.id)),
-    );
+    commit(removeShapes(shapesRef.current, selectedRef.current));
     select(new Set());
+  };
+
+  /** Selected shapes plus their labels, in z-order. */
+  const selectionWithLabels = () => {
+    const ids = withLabels(shapesRef.current, selectedRef.current);
+    return shapesRef.current.filter(s => ids.has(s.id));
+  };
+
+  const selectInserted = (inserted: Shape[]) => {
+    setTool('select');
+    select(new Set(inserted.filter(s => !isLabel(s)).map(s => s.id)));
+  };
+
+  const copySelection = () => {
+    if (!selectedRef.current.size) return false;
+    clipboard = structuredClone(selectionWithLabels());
+    pasteCount = 0;
+    return true;
+  };
+
+  const paste = () => {
+    if (!clipboard.length) return;
+    pasteCount += 1;
+    const clones = cloneShapes(clipboard, { x: 20 * pasteCount, y: 20 * pasteCount });
+    commit([...shapesRef.current, ...clones]);
+    selectInserted(clones);
+  };
+
+  const duplicate = () => {
+    if (!selectedRef.current.size) return;
+    const clones = cloneShapes(selectionWithLabels(), { x: 20, y: 20 });
+    commit([...shapesRef.current, ...clones]);
+    selectInserted(clones);
+  };
+
+  const nudge = (dx: number, dy: number) => {
+    const ids = selectedRef.current;
+    if (!ids.size) return;
+
+    commit(
+      shapesRef.current.map(s =>
+        ids.has(s.id) ? detachFrom(translate(s, dx, dy), ids) : s,
+      ),
+    );
+  };
+
+  /** Z-order among drawn shapes; text always renders on top. */
+  const reorder = (mode: 'front' | 'back' | 'forward' | 'backward') => {
+    const ids = selectedRef.current;
+    if (!ids.size) return;
+
+    const current = shapesRef.current;
+    const texts = current.filter(s => s.kind === 'text');
+    let items = current.filter(s => s.kind !== 'text');
+    const picked = (s: Shape) => ids.has(s.id);
+
+    if (mode === 'front') {
+      items = [...items.filter(s => !picked(s)), ...items.filter(picked)];
+    } else if (mode === 'back') {
+      items = [...items.filter(picked), ...items.filter(s => !picked(s))];
+    } else if (mode === 'forward') {
+      for (let i = items.length - 2; i >= 0; i--) {
+        if (picked(items[i]) && !picked(items[i + 1])) {
+          [items[i], items[i + 1]] = [items[i + 1], items[i]];
+        }
+      }
+    } else {
+      for (let i = 1; i < items.length; i++) {
+        if (picked(items[i]) && !picked(items[i - 1])) {
+          [items[i], items[i - 1]] = [items[i - 1], items[i]];
+        }
+      }
+    }
+
+    commit([...items, ...texts]);
+  };
+
+  const clearAll = () => {
+    if (!shapesRef.current.length) return;
+    commit([]);
+    select(new Set());
+    setToast('Cleared. Ctrl/⌘+Z to undo');
   };
 
   const screenScale = () =>
@@ -334,10 +456,10 @@ export function SketchEditor({ id }: { id: string }) {
   const snapToAnchor = (
     p: Pt,
     exclude?: string,
-  ): Pt | null => {
+  ): { point: Pt; shape: Shape } | null => {
     if (!assist) return null;
 
-    let best: Pt | null = null;
+    let best: { point: Pt; shape: Shape } | null = null;
     let nearest = 12 / screenScale();
 
     for (const shape of shapesRef.current) {
@@ -350,7 +472,7 @@ export function SketchEditor({ id }: { id: string }) {
 
         if (distance < nearest) {
           nearest = distance;
-          best = anchor;
+          best = { point: anchor, shape };
         }
       }
     }
@@ -358,33 +480,97 @@ export function SketchEditor({ id }: { id: string }) {
     return best;
   };
 
+  /**
+   * Resolve a connector end: snap to anchors (binding to that shape),
+   * float-attach when dropped on a shape, otherwise grid / angle snap.
+   * Alt turns every assist off; Shift gives exact 15° steps.
+   */
   const endpoint = (
     from: Pt | null,
     p: Pt,
-    shift: boolean,
+    mods: Mods,
     exclude?: string,
-  ): Pt => {
-    if (from && shift) {
+  ): End => {
+    if (mods.altKey) {
       setSnapHint(null);
-      return snapAngle(from, p, 15);
+      setBindHint(null);
+      return { point: p };
+    }
+
+    if (from && mods.shiftKey) {
+      setSnapHint(null);
+      setBindHint(null);
+      return { point: snapAngle(from, p, 15) };
     }
 
     const anchor = snapToAnchor(p, exclude);
-    setSnapHint(anchor);
 
-    if (anchor) return anchor;
+    if (anchor) {
+      setSnapHint(anchor.point);
+      const binding = isHost(anchor.shape)
+        ? bindingFor(anchor.shape, anchor.point)
+        : undefined;
+      setBindHint(binding ? anchor.shape.id : null);
+      return { point: anchor.point, binding };
+    }
+
+    setSnapHint(null);
+
+    const host = assist
+      ? hostAt(
+          shapesRef.current.filter(s => s.id !== exclude),
+          p,
+          10 / screenScale(),
+        )
+      : null;
+
+    setBindHint(host?.id ?? null);
+
+    if (host) {
+      return { point: p, binding: { id: host.id, fx: 0.5, fy: 0.5 } };
+    }
 
     const q = gridSnap(p);
-    return from && assist && !grid ? softSnap(from, q) : q;
+    return { point: from && assist && !grid ? softSnap(from, q) : q };
   };
 
-  const topmostAt = (p: Pt) => {
+  /** A draft connector with its bound ends resolved, for display and final checks. */
+  const resolveDraft = (shape: Shape): Shape =>
+    isConnector(shape) && (shape.from || shape.to)
+      ? resolveLayout([...shapesRef.current, shape]).at(-1)!
+      : shape;
+
+  /** Snapping targets for smart guides: other shapes and the canvas, not labels or connectors. */
+  const guideTargets = (exclude: Set<string>): Box[] => [
+    { x: 0, y: 0, w: canvasW, h: canvasH },
+    ...shapesRef.current
+      .filter(s =>
+        !exclude.has(s.id) &&
+        !isLabel(s) &&
+        !isConnector(s),
+      )
+      .map(shapeBounds),
+  ];
+
+  const guidesOn = (mods: Mods) => assist && !grid && !mods.altKey;
+
+  /**
+   * Topmost shape under p. A label stands in for its host, so clicking
+   * a label grabs the shape it belongs to; pass raw to get the label itself.
+   */
+  const topmostAt = (p: Pt, raw = false) => {
     const ordered = orderedShapes(shapesRef.current);
 
     for (let i = ordered.length - 1; i >= 0; i--) {
-      if (hitTest(ordered[i], p, 6 / screenScale(), true)) {
-        return ordered[i];
+      const shape = ordered[i];
+      if (!hitTest(shape, p, 6 / screenScale(), true)) continue;
+
+      if (!raw && isLabel(shape)) {
+        const host = shapesRef.current.find(s => s.id === shape.labelFor);
+        if (host) return host;
       }
+
+      return shape;
     }
 
     return null;
@@ -419,13 +605,23 @@ export function SketchEditor({ id }: { id: string }) {
     return handle ? { handle } : null;
   };
 
-  const startText = (next: TextDraft) => {
+  /** Labels take their position from the host; free text keeps its own. */
+  const placeText = (shape: TextShape): TextShape =>
+    shape.labelFor
+      ? resolveLayout([
+          ...shapesRef.current.filter(s => s.id !== shape.id),
+          shape,
+        ]).at(-1) as TextShape
+      : shape;
+
+  const setText = (next: TextDraft) => {
     textRef.current = next;
     setTextDraft(next);
+  };
 
-    select(new Set([
-      next.labelFor ?? next.shape.id,
-    ]));
+  const startText = (next: TextDraft) => {
+    setText({ ...next, shape: placeText(next.shape) });
+    select(new Set([next.shape.labelFor ?? next.shape.id]));
   };
 
   const cancelText = () => {
@@ -434,8 +630,8 @@ export function SketchEditor({ id }: { id: string }) {
     textRef.current = null;
     setTextDraft(null);
 
-    if (previous?.labelFor) {
-      select(new Set([previous.labelFor]));
+    if (previous?.shape.labelFor) {
+      select(new Set([previous.shape.labelFor]));
     }
   };
 
@@ -447,62 +643,72 @@ export function SketchEditor({ id }: { id: string }) {
     cancelText();
 
     const text = currentDraft.shape.text.trim();
-    if (!text) return;
-
-    const next: TextShape = {
-      ...currentDraft.shape,
-      text,
-      ...(currentDraft.center
-        ? {
-            x: currentDraft.center.x -
-              text.length * currentDraft.shape.size * 0.56 / 2,
-            y: currentDraft.center.y -
-              currentDraft.shape.size * 1.1 / 2,
-          }
-        : {}),
-    };
-
     const current = shapesRef.current;
+
+    if (!text) {
+      // Emptying existing text deletes it.
+      if (currentDraft.existing) {
+        commit(removeShapes(current, [currentDraft.shape.id]));
+      }
+      return;
+    }
+
+    const next: TextShape = { ...currentDraft.shape, text };
 
     commit(
       currentDraft.existing
         ? current.map(s => s.id === next.id ? next : s)
         : [...current, next],
     );
-
-    if (currentDraft.labelFor) {
-      select(new Set([currentDraft.labelFor, next.id]));
-    }
   };
 
-  const promptForLabel = (shape: Shape) => {
-    if (shape.kind === 'path' || shape.kind === 'text') return;
+  /** Edit a shape's label, creating one if it has none. */
+  const editLabel = (host: Shape) => {
+    if (!canHaveLabel(host)) return;
 
-    const box = shapeBounds(shape);
-    const connector =
-      shape.kind === 'line' || shape.kind === 'arrow';
+    const label = shapesRef.current.find(
+      (s): s is TextShape => s.kind === 'text' && s.labelFor === host.id,
+    );
 
-    const center = {
-      x: box.x + box.w / 2,
-      y: box.y + box.h / 2 -
-        (connector ? fontSize * 0.8 + 8 : 0),
-    };
+    if (label) {
+      startText({ existing: true, shape: { ...label } });
+      return;
+    }
 
     startText({
       existing: false,
-      labelFor: shape.id,
-      center,
       shape: {
         id: uid(),
         kind: 'text',
-        x: center.x,
-        y: center.y - fontSize * 1.1 / 2,
+        x: 0,
+        y: 0,
         text: '',
         size: fontSize,
         color: '#18181b',
         width,
+        labelFor: host.id,
+        align: 'center',
       },
     });
+  };
+
+  /** Edit any text under the pointer, or the label of the shape there. */
+  const editAt = (p: Pt) => {
+    const raw = topmostAt(p, true);
+
+    if (raw?.kind === 'text') {
+      startText({ existing: true, shape: { ...raw } });
+      return true;
+    }
+
+    const hit = topmostAt(p);
+
+    if (hit && canHaveLabel(hit)) {
+      editLabel(hit);
+      return true;
+    }
+
+    return false;
   };
 
   const releasePointer = () => {
@@ -532,6 +738,8 @@ export function SketchEditor({ id }: { id: string }) {
     setDraft(null);
     setMarquee(null);
     setSnapHint(null);
+    setBindHint(null);
+    setGuides([]);
     releasePointer();
   };
 
@@ -544,9 +752,10 @@ export function SketchEditor({ id }: { id: string }) {
       return;
     }
 
+    // Finish any open text or label, then handle this click as usual,
+    // so the click after drawing a shape is not lost.
     if (textRef.current) {
       commitText();
-      return;
     }
 
     event.preventDefault();
@@ -555,7 +764,7 @@ export function SketchEditor({ id }: { id: string }) {
     const before = shapesRef.current;
 
     if (tool === 'text') {
-      const hit = topmostAt(p);
+      const hit = topmostAt(p, true);
 
       if (hit?.kind === 'text') {
         startText({
@@ -615,7 +824,8 @@ export function SketchEditor({ id }: { id: string }) {
         return;
       }
 
-      const hit = topmostAt(p);
+      // Alt-click picks a label itself rather than its shape.
+      const hit = topmostAt(p, event.altKey);
 
       if (hit) {
         const ids = new Set(selectedRef.current);
@@ -636,11 +846,20 @@ export function SketchEditor({ id }: { id: string }) {
 
         select(ids);
 
+        // Labels follow their hosts, so they don't count towards the moving box.
+        const movingBox = selectionBox(
+          before.filter(s =>
+            ids.has(s.id) &&
+            !(isLabel(s) && ids.has(s.labelFor)),
+          ),
+        );
+
         gestureRef.current = {
           kind: 'move',
           before,
           start: p,
           ids,
+          box: movingBox,
         };
         return;
       }
@@ -672,7 +891,10 @@ export function SketchEditor({ id }: { id: string }) {
       };
 
       preview(
-        before.filter(s => !hitTest(s, p, 8 / screenScale())),
+        removeShapes(
+          before,
+          before.filter(s => hitTest(s, p, 8 / screenScale())).map(s => s.id),
+        ),
       );
       return;
     }
@@ -683,10 +905,21 @@ export function SketchEditor({ id }: { id: string }) {
     if (tool === 'pen') {
       next = { ...base, kind: 'path', points: [p] };
     } else if (tool === 'line' || tool === 'arrow') {
-      const a = endpoint(null, p, false);
-      next = { ...base, kind: tool, a, b: a };
+      const a = endpoint(null, p, event);
+      next = {
+        ...base,
+        kind: tool,
+        a: a.point,
+        b: a.point,
+        ...(a.binding ? { from: a.binding } : {}),
+      };
     } else {
-      const a = gridSnap(p);
+      let a = gridSnap(p);
+
+      if (guidesOn(event)) {
+        const snapped = snapPoint(a, guideTargets(new Set()), 6 / screenScale());
+        a = snapped.point;
+      }
 
       next = {
         ...base,
@@ -702,15 +935,18 @@ export function SketchEditor({ id }: { id: string }) {
     gestureRef.current = {
       kind: 'draw',
       before,
-      start: p,
+      // Rectangles and ellipses grow from their snapped first corner.
+      start: next.kind === 'rect' || next.kind === 'ellipse'
+        ? { x: next.x, y: next.y }
+        : p,
       draft: next,
       points: [p],
     };
 
-    setDraft(next);
+    setDraft(resolveDraft(next));
   };
 
-  const updateGesture = (p: Pt, shift: boolean) => {
+  const updateGesture = (p: Pt, mods: Mods) => {
     const gesture = gestureRef.current;
     if (!gesture) return;
 
@@ -719,12 +955,17 @@ export function SketchEditor({ id }: { id: string }) {
       y: p.y - gesture.start.y,
     };
 
+    const threshold = 6 / screenScale();
+
     switch (gesture.kind) {
       case 'marquee': {
         const box = boxBetween(gesture.start, p);
         const ids = new Set(gesture.base);
 
         for (const shape of gesture.before) {
+          // Labels come along with their shapes; selecting them alone would detach them.
+          if (isLabel(shape)) continue;
+
           if (contained(box, shapeBounds(shape))) {
             ids.add(shape.id);
           }
@@ -738,15 +979,32 @@ export function SketchEditor({ id }: { id: string }) {
       case 'move': {
         if (Math.hypot(delta.x, delta.y) * screenScale() < 2) {
           preview(gesture.before);
+          setGuides([]);
           return;
         }
 
-        const snapped = gridSnap(delta);
+        let d = gridSnap(delta);
+        let lines: Guide[] = [];
 
+        if (gesture.box && guidesOn(mods)) {
+          const moved = {
+            ...gesture.box,
+            x: gesture.box.x + d.x,
+            y: gesture.box.y + d.y,
+          };
+          const snap = snapMove(moved, guideTargets(withLabels(gesture.before, gesture.ids)), threshold);
+          d = { x: d.x + snap.dx, y: d.y + snap.dy };
+          lines = snap.guides;
+        }
+
+        setGuides(lines);
+
+        // Moving part of a group detaches it: connectors whose host stays put
+        // let go of it, and a label dragged without its shape becomes free text.
         preview(
           gesture.before.map(s =>
             gesture.ids.has(s.id)
-              ? translate(s, snapped.x, snapped.y)
+              ? detachFrom(translate(s, d.x, d.y), gesture.ids)
               : s,
           ),
         );
@@ -756,15 +1014,33 @@ export function SketchEditor({ id }: { id: string }) {
       case 'resize': {
         if (Math.hypot(delta.x, delta.y) * screenScale() < 2) {
           preview(gesture.before);
+          setGuides([]);
           return;
         }
 
-        const box = resizedBox(
+        const lockAspect = mods.shiftKey || gesture.original.kind === 'text';
+
+        let box = resizedBox(
           gesture.box,
           gesture.handle,
           gridSnap(delta),
-          shift || gesture.original.kind === 'text',
+          lockAspect,
         );
+
+        let lines: Guide[] = [];
+
+        if (!lockAspect && guidesOn(mods)) {
+          const snap = snapResize(
+            box,
+            gesture.handle,
+            guideTargets(withLabels(gesture.before, new Set([gesture.original.id]))),
+            threshold,
+          );
+          box = snap.box;
+          lines = snap.guides;
+        }
+
+        setGuides(lines);
 
         const resized = scaleShape(
           gesture.original,
@@ -791,16 +1067,21 @@ export function SketchEditor({ id }: { id: string }) {
         const q = endpoint(
           fixed,
           p,
-          shift,
+          mods,
           gesture.original.id,
         );
 
-        if (dist(q, fixed) < 2) return;
+        if (dist(q.point, fixed) < 2) return;
 
-        const changed: Shape = {
+        const key = gesture.end === 'a' ? 'from' : 'to';
+        const changed: Connector = {
           ...gesture.original,
-          [gesture.end]: q,
+          [gesture.end]: q.point,
         };
+
+        // Dropping the end on empty space lets go of the old shape.
+        if (q.binding) changed[key] = q.binding;
+        else delete changed[key];
 
         preview(
           gesture.before.map(s => s.id === changed.id ? changed : s),
@@ -810,8 +1091,11 @@ export function SketchEditor({ id }: { id: string }) {
 
       case 'erase':
         preview(
-          shapesRef.current.filter(
-            s => !hitTest(s, p, 8 / screenScale()),
+          removeShapes(
+            shapesRef.current,
+            shapesRef.current
+              .filter(s => hitTest(s, p, 8 / screenScale()))
+              .map(s => s.id),
           ),
         );
         break;
@@ -832,22 +1116,29 @@ export function SketchEditor({ id }: { id: string }) {
             ...current,
             points: gesture.points.slice(),
           };
-        } else if (
-          current.kind === 'line' ||
-          current.kind === 'arrow'
-        ) {
-          gesture.draft = {
-            ...current,
-            b: endpoint(current.a, p, shift),
-          };
+        } else if (isConnector(current)) {
+          const end = endpoint(current.a, p, mods);
+          const next: Connector = { ...current, b: end.point };
+
+          if (end.binding) next.to = end.binding;
+          else delete next.to;
+
+          gesture.draft = next;
         } else if (
           current.kind === 'rect' ||
           current.kind === 'ellipse'
         ) {
-          const a = gridSnap(gesture.start);
+          const a = gesture.start;
           let q = gridSnap(p);
+          let lines: Guide[] = [];
 
-          if (shift) {
+          if (guidesOn(mods)) {
+            const snap = snapPoint(q, guideTargets(new Set()), threshold);
+            q = snap.point;
+            lines = snap.guides;
+          }
+
+          if (mods.shiftKey) {
             const side = Math.max(
               Math.abs(q.x - a.x),
               Math.abs(q.y - a.y),
@@ -857,7 +1148,10 @@ export function SketchEditor({ id }: { id: string }) {
               x: a.x + Math.sign(q.x - a.x || 1) * side,
               y: a.y + Math.sign(q.y - a.y || 1) * side,
             };
+            lines = [];
           }
+
+          setGuides(lines);
 
           gesture.draft = {
             ...current,
@@ -865,7 +1159,7 @@ export function SketchEditor({ id }: { id: string }) {
           };
         }
 
-        setDraft(gesture.draft);
+        setDraft(resolveDraft(gesture.draft));
         break;
       }
     }
@@ -888,7 +1182,7 @@ export function SketchEditor({ id }: { id: string }) {
     const p = local(event);
 
     if (gestureRef.current) {
-      updateGesture(p, event.shiftKey);
+      updateGesture(p, event);
       return;
     }
 
@@ -900,12 +1194,13 @@ export function SketchEditor({ id }: { id: string }) {
           ? 'end' in control
             ? 'crosshair'
             : CURSORS[control.handle]
-          : topmostAt(p)
+          : topmostAt(p, event.altKey)
             ? 'move'
             : 'default',
       );
     } else if (tool === 'line' || tool === 'arrow') {
-      setSnapHint(snapToAnchor(p));
+      // Show where a new connector would snap or attach.
+      endpoint(null, p, event);
     }
   };
 
@@ -918,20 +1213,27 @@ export function SketchEditor({ id }: { id: string }) {
     }
 
     if (event && gestureRef.current) {
-      updateGesture(local(event), event.shiftKey);
+      updateGesture(local(event), event);
     }
 
+    const mods: Mods = event ?? NO_MODS;
     const gesture = gestureRef.current;
     gestureRef.current = null;
 
     setDraft(null);
     setMarquee(null);
-    setSnapHint(null);
+    setGuides([]);
     releasePointer();
 
-    if (!gesture || gesture.kind === 'marquee') return;
+    if (!gesture || gesture.kind === 'marquee') {
+      setSnapHint(null);
+      setBindHint(null);
+      return;
+    }
 
     if (gesture.kind !== 'draw') {
+      setSnapHint(null);
+      setBindHint(null);
       commit(shapesRef.current, gesture.before);
       return;
     }
@@ -969,18 +1271,29 @@ export function SketchEditor({ id }: { id: string }) {
         next = { ...next, points };
       }
 
+      // A drawn line connects to the shapes its ends land on.
       if (next.kind === 'line') {
+        const a = endpoint(null, next.a, mods);
+        const b = endpoint(null, next.b, mods);
+
         next = {
           ...next,
-          a: snapToAnchor(next.a) ?? next.a,
-          b: snapToAnchor(next.b) ?? next.b,
+          a: a.point,
+          b: b.point,
+          ...(a.binding ? { from: a.binding } : {}),
+          ...(b.binding ? { to: b.binding } : {}),
         };
       }
     }
 
+    setSnapHint(null);
+    setBindHint(null);
+
+    const resolved = resolveDraft(next);
+
     if (
-      (next.kind === 'line' || next.kind === 'arrow') &&
-      dist(next.a, next.b) < 3
+      isConnector(resolved) &&
+      dist(resolved.a, resolved.b) < 3
     ) {
       return;
     }
@@ -993,7 +1306,7 @@ export function SketchEditor({ id }: { id: string }) {
     }
 
     commit([...gesture.before, next], gesture.before);
-    promptForLabel(next);
+    editLabel(next);
   };
 
   const close = () => {
@@ -1053,7 +1366,79 @@ export function SketchEditor({ id }: { id: string }) {
       if (mod && key === 'a') {
         event.preventDefault();
         setTool('select');
-        select(new Set(shapesRef.current.map(s => s.id)));
+        select(new Set(
+          shapesRef.current.filter(s => !isLabel(s)).map(s => s.id),
+        ));
+        return;
+      }
+
+      if (mod && key === 'c') {
+        if (copySelection()) event.preventDefault();
+        return;
+      }
+
+      if (mod && key === 'x') {
+        if (copySelection()) {
+          event.preventDefault();
+          deleteSelected();
+        }
+        return;
+      }
+
+      if (mod && key === 'v') {
+        if (clipboard.length) {
+          event.preventDefault();
+          paste();
+        }
+        return;
+      }
+
+      if (mod && key === 'd') {
+        event.preventDefault();
+        duplicate();
+        return;
+      }
+
+      if (
+        mod &&
+        (event.code === 'BracketRight' || event.code === 'BracketLeft')
+      ) {
+        event.preventDefault();
+        const up = event.code === 'BracketRight';
+        reorder(
+          event.shiftKey
+            ? up ? 'front' : 'back'
+            : up ? 'forward' : 'backward',
+        );
+        return;
+      }
+
+      const arrows: Record<string, Pt> = {
+        ArrowLeft: { x: -1, y: 0 },
+        ArrowRight: { x: 1, y: 0 },
+        ArrowUp: { x: 0, y: -1 },
+        ArrowDown: { x: 0, y: 1 },
+      };
+
+      if (arrows[event.key] && selectedRef.current.size && !mod) {
+        event.preventDefault();
+        const step = grid ? GRID : event.shiftKey ? 10 : 1;
+        nudge(arrows[event.key].x * step, arrows[event.key].y * step);
+        return;
+      }
+
+      if (event.key === 'Enter' && !mod) {
+        const shape = singleSelected();
+
+        if (shape) {
+          event.preventDefault();
+
+          if (shape.kind === 'text') {
+            startText({ existing: true, shape: { ...shape } });
+          } else {
+            editLabel(shape);
+          }
+        }
         return;
       }
 
@@ -1117,9 +1502,99 @@ export function SketchEditor({ id }: { id: string }) {
     }
   };
 
-  const selectedTexts = selectedShapes.filter(
-    (s): s is TextShape => s.kind === 'text',
+  // Font size reaches the labels of selected shapes as well as selected text.
+  const isSelectedText = (s: Shape, ids: Set<string>): s is TextShape =>
+    s.kind === 'text' &&
+    (ids.has(s.id) || Boolean(s.labelFor && ids.has(s.labelFor)));
+
+  const selectedTexts = shapes.filter(
+    (s): s is TextShape => isSelectedText(s, selected),
   );
+
+  const updateDraft = (patch: Partial<TextShape>) => {
+    const currentDraft = textRef.current;
+    if (!currentDraft) return false;
+
+    setText({
+      ...currentDraft,
+      shape: placeText({ ...currentDraft.shape, ...patch }),
+    });
+    return true;
+  };
+
+  const mixedColors = selectedShapes.length > 1 &&
+    selectedShapes.some(s => s.color !== selectedShapes[0].color);
+
+  const displayedColor = textDraft?.shape.color ??
+    selectedShapes[0]?.color ??
+    color;
+
+  const applyColor = (value: string) => {
+    setColor(value);
+
+    if (updateDraft({ color: value })) {
+      inputRef.current?.focus();
+      return;
+    }
+
+    if (selectedRef.current.size) {
+      commit(
+        shapesRef.current.map(s =>
+          selectedRef.current.has(s.id) ? { ...s, color: value } : s,
+        ),
+      );
+    }
+  };
+
+  const stroked = selectedShapes.filter(s => s.kind !== 'text');
+
+  const mixedWidths = stroked.length > 1 &&
+    stroked.some(s => s.width !== stroked[0].width);
+
+  const displayedWidth = stroked[0]?.width ?? width;
+
+  const applyWidth = (value: number) => {
+    setWidth(value);
+
+    if (stroked.length) {
+      commit(
+        shapesRef.current.map(s =>
+          selectedRef.current.has(s.id) && s.kind !== 'text'
+            ? { ...s, width: value }
+            : s,
+        ),
+      );
+    }
+  };
+
+  const freeTexts = selectedShapes.filter(s => s.kind === 'text' && !s.labelFor);
+  const canAttach = freeTexts.length > 0 &&
+    selectedShapes.some(canHaveLabel);
+
+  const attachSelected = () => {
+    const result = attachTexts(shapesRef.current, selectedRef.current);
+    if (!result.count) {
+      setToast('Put the text inside a selected shape to attach it');
+      return;
+    }
+
+    commit(result.shapes);
+    select(new Set(
+      [...selectedRef.current].filter(id =>
+        !result.shapes.some(s => s.id === id && isLabel(s)),
+      ),
+    ));
+    setToast(result.count === 1 ? 'Label attached' : `${result.count} labels attached`);
+  };
+
+  const canDetach = shapes.some(s =>
+    isLabel(s) && (selected.has(s.id) || selected.has(s.labelFor)),
+  );
+
+  const detachSelected = () => {
+    commit(detachLabels(shapesRef.current, selectedRef.current));
+    setToast('Label detached');
+  };
 
   const mixedFontSizes = !textDraft &&
     selectedTexts.length > 1 &&
@@ -1153,23 +1628,12 @@ export function SketchEditor({ id }: { id: string }) {
     setFontInput(String(size));
     localStorage.setItem('notes.fontSize', String(size));
 
-    const currentDraft = textRef.current;
+    if (updateDraft({ size })) return;
 
-    if (currentDraft) {
-      const next: TextDraft = {
-        ...currentDraft,
-        shape: {
-          ...currentDraft.shape,
-          size,
-        },
-      };
-
-      textRef.current = next;
-      setTextDraft(next);
-    } else if (selectedTexts.length) {
+    if (selectedTexts.length) {
       commit(
         shapesRef.current.map(s =>
-          s.kind === 'text' && selectedRef.current.has(s.id)
+          isSelectedText(s, selectedRef.current)
             ? { ...s, size }
             : s,
         ),
@@ -1178,6 +1642,31 @@ export function SketchEditor({ id }: { id: string }) {
   };
 
   const input = textDraft?.shape;
+
+  const inputWidth = input
+    ? Math.max(
+        input.labelFor ? 280 : 180,
+        input.text.length * input.size * 0.75 + 40,
+      )
+    : 0;
+
+  const hint = input?.labelFor
+    ? 'Type a label · Enter saves · Esc skips'
+    : input
+      ? 'Enter saves · Esc cancels'
+      : tool === 'select'
+        ? selected.size
+          ? `${selected.size} selected · Drag to move · Enter: label · ⌘D: duplicate · Arrows: nudge · ⌘]/⌘[: order · Alt: no snapping`
+          : 'Drag empty space to box-select · Double-click a shape to label it · Alt+click picks a label'
+        : tool === 'line' || tool === 'arrow'
+          ? 'Start or end on a shape to connect it · Shift: 15° steps · Alt: no snapping'
+          : tool === 'rect' || tool === 'ellipse'
+            ? 'Shift: square / circle · Alt: no snapping'
+            : tool === 'pen'
+              ? 'With Assist on, rough shapes become clean ones'
+              : tool === 'text'
+                ? 'Click to add text · click existing text to edit'
+                : 'Drag over shapes to erase them';
 
   const cursor = tool === 'select'
     ? hoverCursor
@@ -1223,13 +1712,14 @@ export function SketchEditor({ id }: { id: string }) {
             <button
               key={value}
               type="button"
+              data-keeps-text="true"
               title={`Stroke ${COLOR_NAMES[index]}`}
               aria-label={`Stroke ${COLOR_NAMES[index]}`}
-              aria-pressed={color === value}
-              onClick={() => setColor(value)}
+              aria-pressed={!mixedColors && displayedColor === value}
+              onClick={() => applyColor(value)}
               className={cn(
                 'h-6 w-6 rounded-full border-2',
-                color === value
+                !mixedColors && displayedColor === value
                   ? 'border-zinc-400 ring-1 ring-zinc-400'
                   : 'border-transparent',
               )}
@@ -1242,8 +1732,9 @@ export function SketchEditor({ id }: { id: string }) {
               key={value}
               size="icon"
               title={`Stroke ${value}px`}
-              active={width === value}
-              onClick={() => setWidth(value)}
+              aria-pressed={!mixedWidths && displayedWidth === value}
+              active={!mixedWidths && displayedWidth === value}
+              onClick={() => applyWidth(value)}
             >
               <span
                 className="rounded-full bg-current"
@@ -1310,7 +1801,7 @@ export function SketchEditor({ id }: { id: string }) {
           <Separator vertical />
 
           <label
-            data-font-size="true"
+            data-keeps-text="true"
             className="flex items-center gap-1 px-1 text-xs text-zinc-600"
           >
             <span>Font</span>
@@ -1395,16 +1886,11 @@ export function SketchEditor({ id }: { id: string }) {
             <Button
               size="icon"
               variant="danger"
-              title={selected.size ? 'Delete selection' : 'Clear sketch'}
+              title={selected.size ? 'Delete selection (Delete)' : 'Clear sketch (undoable)'}
+              aria-label={selected.size ? 'Delete selection' : 'Clear sketch'}
               onClick={() => {
-                if (selectedRef.current.size) {
-                  deleteSelected();
-                } else if (
-                  shapesRef.current.length &&
-                  confirm('Clear the whole sketch?')
-                ) {
-                  commit([]);
-                }
+                if (selectedRef.current.size) deleteSelected();
+                else clearAll();
               }}
             >
               <Trash2 className="h-4 w-4" />
@@ -1433,7 +1919,10 @@ export function SketchEditor({ id }: { id: string }) {
               if (gestureRef.current) cancelGesture();
             }}
             onPointerLeave={() => {
-              if (!gestureRef.current) setSnapHint(null);
+              if (!gestureRef.current) {
+                setSnapHint(null);
+                setBindHint(null);
+              }
             }}
             onDoubleClick={event => {
               if (tool !== 'select' && tool !== 'text') return;
@@ -1444,16 +1933,7 @@ export function SketchEditor({ id }: { id: string }) {
                 return;
               }
 
-              const hit = topmostAt(local(event));
-
-              if (hit?.kind === 'text') {
-                event.preventDefault();
-
-                startText({
-                  existing: true,
-                  shape: { ...hit },
-                });
-              }
+              if (editAt(local(event))) event.preventDefault();
             }}
           >
             <defs>
@@ -1573,6 +2053,54 @@ export function SketchEditor({ id }: { id: string }) {
               />
             )}
 
+            {bindHint && (() => {
+              const host = shapes.find(s => s.id === bindHint);
+              if (!host) return null;
+
+              return (
+                <polyline
+                  points={outline(host).map(q => `${q.x},${q.y}`).join(' ')}
+                  fill="#3b82f60f"
+                  stroke="#3b82f6"
+                  strokeOpacity={0.55}
+                  strokeWidth={host.width + 5}
+                  strokeLinejoin="round"
+                  pointerEvents="none"
+                />
+              );
+            })()}
+
+            {guides.length > 0 && (
+              <g
+                pointerEvents="none"
+                stroke="#ec4899"
+                strokeWidth={1}
+              >
+                {guides.map((g, index) => {
+                  if (g.type === 'align') {
+                    return g.axis === 'x'
+                      ? <line key={index} x1={g.at} x2={g.at} y1={g.from - 8} y2={g.to + 8} />
+                      : <line key={index} y1={g.at} y2={g.at} x1={g.from - 8} x2={g.to + 8} />;
+                  }
+
+                  // Equal-gap marker: a span with end ticks.
+                  return g.axis === 'x' ? (
+                    <g key={index}>
+                      <line x1={g.from} x2={g.to} y1={g.at} y2={g.at} />
+                      <line x1={g.from} x2={g.from} y1={g.at - 4} y2={g.at + 4} />
+                      <line x1={g.to} x2={g.to} y1={g.at - 4} y2={g.at + 4} />
+                    </g>
+                  ) : (
+                    <g key={index}>
+                      <line y1={g.from} y2={g.to} x1={g.at} x2={g.at} />
+                      <line y1={g.from} y2={g.from} x1={g.at - 4} x2={g.at + 4} />
+                      <line y1={g.to} y2={g.to} x1={g.at - 4} x2={g.at + 4} />
+                    </g>
+                  );
+                })}
+              </g>
+            )}
+
             {snapHint && (
               <circle
                 cx={snapHint.x}
@@ -1587,19 +2115,16 @@ export function SketchEditor({ id }: { id: string }) {
             {input && (
               <foreignObject
                 data-text-editor="true"
-                x={input.x - 2}
+                x={input.align === 'center' ? input.x - inputWidth / 2 : input.x - 2}
                 y={input.y - 2}
-                width={Math.max(
-                  textDraft?.labelFor ? 280 : 180,
-                  input.text.length * input.size * 0.75 + 40,
-                )}
+                width={inputWidth}
                 height={input.size * 1.5 + 8}
                 style={{ overflow: 'visible' }}
               >
                 <input
                   ref={inputRef}
                   aria-label={
-                    textDraft?.labelFor
+                    input.labelFor
                       ? 'Shape label'
                       : textDraft?.existing
                         ? 'Edit text'
@@ -1607,8 +2132,8 @@ export function SketchEditor({ id }: { id: string }) {
                   }
                   value={input.text}
                   placeholder={
-                    textDraft?.labelFor
-                      ? 'Label (Enter to save, Esc to skip)'
+                    input.labelFor
+                      ? 'Label (Enter saves, Esc skips)'
                       : 'Type...'
                   }
                   onPointerDown={event => event.stopPropagation()}
@@ -1617,16 +2142,13 @@ export function SketchEditor({ id }: { id: string }) {
                     const current = textRef.current;
                     if (!current) return;
 
-                    const next: TextDraft = {
+                    setText({
                       ...current,
                       shape: {
                         ...current.shape,
                         text: event.target.value,
                       },
-                    };
-
-                    textRef.current = next;
-                    setTextDraft(next);
+                    });
                   }}
                   onKeyDown={event => {
                     event.stopPropagation();
@@ -1644,7 +2166,7 @@ export function SketchEditor({ id }: { id: string }) {
                   onBlur={event => {
                     if (
                       (event.relatedTarget as Element | null)
-                        ?.closest('[data-font-size]')
+                        ?.closest('[data-keeps-text]')
                     ) {
                       return;
                     }
@@ -1657,6 +2179,7 @@ export function SketchEditor({ id }: { id: string }) {
                     fontWeight: 500,
                     fontSize: input.size,
                     lineHeight: 1.1,
+                    textAlign: input.align === 'center' ? 'center' : 'left',
                     color: input.color,
                     padding: 2,
                     background: 'white',
@@ -1676,12 +2199,70 @@ export function SketchEditor({ id }: { id: string }) {
           )}
         </div>
 
-        <div className="border-t border-zinc-100 px-4 py-1.5 text-xs text-zinc-500">
-          {textDraft?.labelFor
-            ? 'Type a label. Enter saves; Escape skips. Font size can be changed above.'
-            : tool === 'select'
-              ? `${selected.size} selected | Drag empty space to box-select. Shift adds/toggles. Drag selected items to move together. Drag borders to resize or arrow endpoints to redirect. Double-click text to edit.`
-              : 'V: select | Shift: constrain proportions/angles | S: assist | G: grid | Ctrl/Cmd+Z: undo'}
+        <div className="flex min-h-10 items-center gap-2 border-t border-zinc-100 px-4 py-1 text-xs text-zinc-500">
+          <span className="min-w-0 flex-1 truncate" title={hint}>
+            {hint}
+          </span>
+
+          {tool === 'select' && selected.size > 0 && !textDraft && (
+            <div
+              role="group"
+              aria-label="Arrange selection"
+              className="flex shrink-0 items-center gap-0.5"
+            >
+              {canAttach && (
+                <Button
+                  className="h-7 px-2 text-xs"
+                  title="Attach the selected text to the shape it sits in"
+                  onClick={attachSelected}
+                >
+                  <Link2 className="h-3.5 w-3.5" />
+                  Attach text
+                </Button>
+              )}
+
+              {canDetach && (
+                <Button
+                  className="h-7 px-2 text-xs"
+                  title="Turn the label back into free text"
+                  onClick={detachSelected}
+                >
+                  <Unlink2 className="h-3.5 w-3.5" />
+                  Detach label
+                </Button>
+              )}
+
+              <Button
+                size="icon"
+                className="h-7 w-7"
+                title="Duplicate (Ctrl/⌘+D)"
+                aria-label="Duplicate"
+                onClick={duplicate}
+              >
+                <CopyPlus className="h-3.5 w-3.5" />
+              </Button>
+
+              <Button
+                size="icon"
+                className="h-7 w-7"
+                title="Bring to front (Ctrl/⌘+Shift+])"
+                aria-label="Bring to front"
+                onClick={() => reorder('front')}
+              >
+                <BringToFront className="h-3.5 w-3.5" />
+              </Button>
+
+              <Button
+                size="icon"
+                className="h-7 w-7"
+                title="Send to back (Ctrl/⌘+Shift+[)"
+                aria-label="Send to back"
+                onClick={() => reorder('back')}
+              >
+                <SendToBack className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          )}
         </div>
       </div>
     </div>

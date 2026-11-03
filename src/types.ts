@@ -24,6 +24,13 @@ export type Group = {
   h: number;
 };
 
+/** Ties a connector end to a host shape. fx/fy are relative to the host's bounds; 0.5/0.5 floats to the outline. */
+export type Binding = {
+  id: string;
+  fx: number;
+  fy: number;
+};
+
 type ShapeBase = {
   id: string;
   color: string;
@@ -40,6 +47,8 @@ export type Shape =
       kind: 'line' | 'arrow';
       a: Pt;
       b: Pt;
+      from?: Binding;
+      to?: Binding;
     })
   | (ShapeBase & {
       kind: 'rect' | 'ellipse';
@@ -58,6 +67,10 @@ export type Shape =
       y: number;
       text: string;
       size: number;
+      /** Host shape id: the label follows, resizes with and is deleted with it. */
+      labelFor?: string;
+      /** 'center' means x is the horizontal centre of the text. */
+      align?: 'start' | 'center';
     });
 
 export type Sketch = {

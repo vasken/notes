@@ -90,6 +90,7 @@ export function ShapeEl({ s }: { s: Shape }) {
           fill={s.color}
           fontSize={s.size}
           fontWeight={500}
+          textAnchor={s.align === 'center' ? 'middle' : undefined}
           fontFamily="ui-sans-serif, system-ui, sans-serif"
         >
           {s.text}
